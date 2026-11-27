@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SNI Scanner</title>
+<style>
+  :root { --bg:#0d1117; --card:#161b22; --line:#30363d; --text:#e6edf3; --mute:#8b949e; --blue:#58a6ff; --green:#3fb950; --red:#f85149; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--text); font:14px -apple-system,Segoe UI,Roboto,sans-serif; }
+  h1 { font-size:16px; margin:8px 4px 14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  label { display:block; font-size:12px; color:var(--mute); margin:10px 0 4px; }
+  input[type=text], input[type=number], textarea, input[type=file] {
+    width:100%; background:#0d1117; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:10px; font-size:14px; }
+  textarea { height:100px; font-family:ui-monospace,monospace; font-size:13px; }
+  .row { display:flex; gap:10px; } .row > div { flex:1; }
+  button { background:var(--blue); color:#fff; border:0; border-radius:6px; padding:11px; font-size:14px; font-weight:600; width:100%; margin-top:12px; }
+  button.sec { background:transparent; border:1px solid var(--line); color:var(--text); width:auto; margin:0; padding:8px 12px; }
+  button.stop { background:var(--red); }
+  .bar { height:5px; background:#21262d; border-radius:3px; margin-top:12px; overflow:hidden; }
+  .bar > div { height:100%; width:0; background:var(--blue); transition:width .2s; }
+  #status { font-size:12px; color:var(--mute); margin-top:8px; min-height:16px; word-break:break-word; }
+  .tools { display:flex; gap:8px; align-items:center; }
+  .tools input[type=text] { flex:1; }
+  .tools label { display:flex; align-items:center; gap:5px; margin:0; font-size:12px; white-space:nowrap; }
+  table { width:100%; border-collapse:collapse; margin-top:12px; font-size:12px; }
+  th { text-align:left; color:var(--mute); font-weight:500; padding:8px 4px; border-bottom:1px solid var(--line); }
+  td { padding:7px 4px; border-bottom:1px solid #21262d; word-break:break-all; }
+  .ok { color:var(--green); } .bad { color:var(--red); }
+  .wrap { overflow-x:auto; }
+</style>
+</head>
+<body>
+<h1>SNI Scanner</h1>
+
+<div class="card">
+  <label>Target host, IP or CIDR (comma separated for several)</label>
+  <input type="text" id="target" value="41.90.96.0/24" placeholder="41.90.96.0/24">
+  <div class="row">
+    <div><label>Port</label><input type="number" id="port" value="443"></div>
+    <div><label>WebSocket path (optional)</label><input type="text" id="path" placeholder="/vmess"></div>
+  </div>
+  <label>Hostnames to test (one per line)</label>
+  <textarea id="hosts">safaricom.co.ke</textarea>
+  <label>...or load a .txt file</label>
+  <input type="file" id="file" accept=".txt">
+  <button id="go">Scan</button>
+  <div class="bar"><div id="prog"></div></div>
+  <div id="status"></div>
+</div>
+
+<div class="card">
+  <div class="tools">
+    <input type="text" id="filter" placeholder="Filter results...">
+    <label><input type="checkbox" id="onlyok" checked> Working only</label>
+    <button class="sec" id="copy">Copy</button>
+    <button class="sec" id="csv">CSV</button>
+  </div>
+  <div class="wrap">
+    <table>
+      <thead><tr><th>IP</th><th>Hostname</th><th>Result</th><th>ms</th><th>Detail</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const MAX_IPS = 65536;     // refuse ranges bigger than /16
+const PROBES_PER_REQ = 240;
+const PARALLEL_REQS = 3;
+
+let results = [];
+let running = false;
+let cancelled = false;
+
+function expandCidr(input) {
+  const [ip, bitsStr = '32'] = input.trim().split('/');
+  const bits = Number(bitsStr);
+  const p = ip.split('.').map(Number);
+  if (p.length !== 4 || p.some((n) => !(n >= 0 && n <= 255)) || !(bits >= 0 && bits <= 32)) return null;
+  if (32 - bits > 16) throw new Error('Range too large (max /16): ' + input);
+  const base = ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+  const size = 2 ** (32 - bits);
+  const start = (base & (~(size - 1) >>> 0)) >>> 0;
+  const out = [];
+  for (let i = 0; i < size; i++) {
+    const n = (start + i) >>> 0;
+    out.push([n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.'));
+  }
+  return out;
+}
+
+function expandTargets(text) {
+  const out = [];
+  for (const raw of text.split(/[,\s]+/).filter(Boolean)) {
+    const ips = /^\d+\.\d+\.\d+\.\d+(\/\d+)?$/.test(raw) ? expandCidr(raw) : [raw];
+    if (!ips) throw new Error('Invalid target: ' + raw);
+    out.push(...ips);
+    if (out.length > MAX_IPS) throw new Error('Too many addresses (max ' + MAX_IPS + ')');
+  }
+  return out;
+}
+
+function getHosts() {
+  return $('hosts').value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+}
+
+$('file').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $('hosts').value = (await f.text()).trim();
+});
+
+function render() {
+  const q = $('filter').value.toLowerCase();
+  const only = $('onlyok').checked;
+  const shown = results.filter((r) =>
+    (!only || r.ok) &&
+    (!q || (r.ip + ' ' + r.sni + ' ' + r.detail).toLowerCase().includes(q)));
+  $('rows').innerHTML = shown.length
+    ? shown.map((r) =>
+        `<tr><td>${esc(r.ip)}</td><td>${esc(r.sni)}</td>` +
+        `<td class="${r.ok ? 'ok' : 'bad'}">${r.ok ? 'OK' : 'Fail'}</td>` +
+        `<td>${r.ms}</td><td>${esc(r.detail || '')}</td></tr>`).join('')
+    : '<tr><td colspan="5" style="color:var(--mute)">No matching results.</td></tr>';
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c])); }
+
+$('filter').addEventListener('input', render);
+$('onlyok').addEventListener('change', render);
+
+$('copy').addEventListener('click', async () => {
+  const lines = results.filter((r) => r.ok).map((r) => r.ip + ' ' + r.sni);
+  try { await navigator.clipboard.writeText(lines.join('\n')); $('status').textContent = 'Copied ' + lines.length + ' working entries'; }
+  catch (e) { $('status').textContent = 'Copy failed'; }
+});
+
+$('csv').addEventListener('click', () => {
+  const rows = [['ip', 'hostname', 'result', 'ms', 'detail']].concat(
+    results.map((r) => [r.ip, r.sni, r.ok ? 'OK' : 'Fail', r.ms, r.detail || '']));
+  const csv = rows.map((r) => r.map((v) => '"' + String(v).replace(/"/g, '""') + '"').join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  a.download = 'sni-results.csv';
+  a.click();
+});
+
+async function runScan() {
+  const hosts = getHosts();
+  if (!hosts.length) { $('status').textContent = 'Add at least one hostname'; return; }
+  let ips;
+  try { ips = expandTargets($('target').value); }
+  catch (e) { $('status').textContent = 'Error: ' + e.message; return; }
+  if (!ips.length) { $('status').textContent = 'Enter a target'; return; }
+
+  const port = parseInt($('port').value, 10) || 443;
+  const path = $('path').value.trim();
+  const perReq = Math.max(1, Math.floor(PROBES_PER_REQ / hosts.length));
+  const batches = [];
+  for (let i = 0; i < ips.length; i += perReq) batches.push(ips.slice(i, i + perReq));
+
+  results = []; render();
+  running = true; cancelled = false;
+  $('go').textContent = 'Stop'; $('go').classList.add('stop');
+
+  const totalProbes = ips.length * hosts.length;
+  let doneProbes = 0, working = 0, next = 0, errors = 0;
+
+  async function worker() {
+    while (!cancelled && next < batches.length) {
+      const batch = batches[next++];
+      try {
+        const r = await fetch('/api/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ips: batch, hosts, port, path }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || r.status);
+        for (const x of data.results) { results.push(x); if (x.ok) working++; }
+      } catch (e) {
+        errors++;
+        $('status').textContent = 'Batch error: ' + e.message;
+      }
+      doneProbes += batch.length * hosts.length;
+      $('prog').style.width = Math.min(100, (doneProbes / totalProbes) * 100) + '%';
+      if (!errors) $('status').textContent = `Scanned ${doneProbes}/${totalProbes} · working: ${working}`;
+      render();
+    }
+  }
+  await Promise.all(Array.from({ length: PARALLEL_REQS }, worker));
+
+  running = false;
+  $('go').textContent = 'Scan'; $('go').classList.remove('stop');
+  $('status').textContent = (cancelled ? 'Stopped. ' : 'Done. ') +
+    `Scanned ${doneProbes}/${totalProbes} · working: ${working}` + (errors ? ` · ${errors} batch errors` : '');
+}
+
+$('go').addEventListener('click', () => {
+  if (running) { cancelled = true; return; }
+  runScan();
+});
+render();
+</script>
+</body>
+</html>
