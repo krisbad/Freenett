@@ -1,0 +1,2 @@
+# Freenett
+Enjoy
